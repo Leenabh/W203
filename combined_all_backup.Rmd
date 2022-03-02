@@ -1,0 +1,423 @@
+---
+title: "by_day"
+output: pdf_document
+---
+```{r load packages}
+library(tidyverse)
+library(data.table)
+library(ggplot2)
+library(patchwork)
+library(sandwich)
+library(lmtest)
+library(readxl)
+library(stargazer)
+library(corrplot)
+
+start_dt <- '2020-03-01'
+end_dt <- '2020-12-14'
+```
+
+```{r load & transform nyt data}
+nyt <- read.csv('data/raw/us-states.csv')
+nyt$date <- as.Date(nyt$date)
+nyt <- filter(nyt, (nyt$date >= start_dt) & (nyt$date <= end_dt))
+nyt_by_state <- nyt %>%
+  group_by(state) %>%
+  summarise(
+    deaths = max(deaths) - min(deaths)
+    , cases = max(cases) - min(cases)
+  )
+df_first_death <- nyt %>%
+  filter(nyt$deaths > 0) %>%
+  group_by(state) %>%
+  summarise(first_death = min(date))
+df_first_case <- nyt %>%
+  group_by(state) %>%
+  summarise(first_case = min(date))
+nyt_by_state <- merge(nyt_by_state, df_first_death, by = 'state')
+nyt_by_state <- merge(nyt_by_state, df_first_case, by = 'state')
+nyt_by_state
+```
+
+```{r load and transform census data}
+census <- read_csv('data/raw/ACSDP1Y2019.DP05_data_with_overlays_2021-03-25T141408.csv', skip = 1)
+census <- census %>%
+  mutate(
+    total_population = census$'Estimate!!SEX AND AGE!!Total population'
+    , sixtyfive_plus_percentage = 100*(census$'Estimate!!SEX AND AGE!!Total population!!65 to 74 years' + census$'Estimate!!SEX AND AGE!!Total population!!75 to 84 years' + census$'Estimate!!SEX AND AGE!!Total population!!85 years and over')/census$'Estimate!!SEX AND AGE!!Total population'
+      ) %>%
+  select('Geographic Area Name', total_population, sixtyfive_plus_percentage)
+census
+```
+```{r load and transform land area by state}
+area_by_state <- read.csv('data/raw/land_area_by_state.csv')
+area_by_state <- area_by_state[-c(1:2),]
+area_by_state[c(2:7)] <- sapply(area_by_state[c(2:7)],as.numeric)
+area_by_state
+```
+
+```{r merging census and state level data}
+merged <- merge(nyt_by_state, census, by.x = 'state', by.y = 'Geographic Area Name', ALL = TRUE)
+merged <- merge(merged, area_by_state, by.x = 'state', by.y = 'State.and.other.areas')
+merged <- merged %>% 
+  mutate(pop_density = total_population / Land.Area)
+merged
+```
+
+Adding the Closure Data
+
+```{r}
+closures = read.csv(file = "data/raw/3_23 COVID-19 US state policy database  - Closures & Reopening.csv")
+```
+
+
+
+```{r}
+closure_end_date = '12/14/2020'
+first_case = "3/1/2020"
+```
+
+
+### GYM Closure 
+
+#### EDA Logic
+Since the logic is now a little more complicated for calculating the number of days of closure, I would be creating different data frames for different types of closures, so that we can catch any errors. The states that did not reopen the first time, remained closed through the end date. So we could put our study end date as the end date at the fist closure date.
+
+For second closures, only PA and RI reopned their gyms and their reopening date was after our end of our study (either 0 or actual date). So we can place the end date as the study end date for those states that reopened their gyms. 
+
+#### GYM Closure Code
+```{r}
+gymClosure = closures %>%
+  mutate(
+    Reopened.gyms_m = case_when(
+      Reopened.gyms == 0 & Closed.gyms !=0 ~ as.Date(closure_end_date, format = "%m/%d/%y"),
+      TRUE ~ as.Date(Reopened.gyms, format = "%m/%d/%y") 
+    ),
+    Reopened.gyms.x2_m = case_when(
+      Closed.gyms.x2 != 0 ~ as.Date(closure_end_date, format = "%m/%d/%y"),
+      TRUE ~ as.Date(Reopened.gyms.x2, format = "%m/%d/%y") 
+    ),
+    NumberOfGymClosureDayFirstClosure = as.Date(Reopened.gyms_m, format = "%m/%d/%y") - as.Date(Closed.gyms, format = "%m/%d/%y"),
+    NumberOfGymClosureDaySecondClosure = as.Date(Reopened.gyms.x2_m, format = "%m/%d/%y") - as.Date(Closed.gyms.x2, format = "%m/%d/%y"),
+    NumberOfGymClosureDayFirstClosure = replace_na(NumberOfGymClosureDayFirstClosure, 0),
+    NumberOfGymClosureDaySecondClosure = replace_na(NumberOfGymClosureDaySecondClosure, 0),
+    TotalGymClosure = NumberOfGymClosureDayFirstClosure + NumberOfGymClosureDaySecondClosure
+    ) %>%
+  select(
+    State, Reopened.gyms, Closed.gyms, Reopened.gyms_m, Reopened.gyms.x2, Closed.gyms.x2,Reopened.gyms.x2_m, NumberOfGymClosureDayFirstClosure, NumberOfGymClosureDaySecondClosure, TotalGymClosure
+  )
+gymClosure
+```
+
+### Restaurant Closure
+
+#### EDA Logic 
+All the states except SD closed and reopened teh restaurants in the first phase. So we do not need to do any corrections to match our end date during the first closure. For second closure, one state closed after our study end date, so we modify it to bring it to the study end date. In the second reopening, two sates reopen after the study end date, so we bring correct them to our study end date. In the third set of closures, only one state started and closed before our end date, so we did not do any modification there. 
+
+Important notes about Closure:
+a. Closed.Restarants - The date when states closed restaurants (except for takeout). Did not include guidance or recommendations. Order must apply to entire state. 0: policy not implemented;
+b. Reopen restaurants - The date when states reopened restaurants (for indoor and/or outdoor dining) statewide. If states never closed restaurants, they will be marked as 0. 0:policy not implemented;
+To calculate the difference, we could use end date - start date. We could double check if there are any issue where the there is a case where start date is 0 and there is an end date. The end date of ourt study is Dec 14. So we would like to keep the latest date as 12/14. 
+
+
+#### Restaurant Closure Code
+
+```{r}
+restaurantClosure = closures %>%
+  mutate(
+    Reopened.restaurants.x2_m = case_when(
+    Reopened.restaurants.x2 == "1/22/2021" ~ closure_end_date,
+    Reopened.restaurants.x2 == "1/4/2021" ~ closure_end_date,
+    #Reopened.restaurants.x2 == "8/29/2020" ~ "8/29/2020"
+    TRUE ~ as.character(Reopened.restaurants.x2)
+  ),
+  Closed.restaurants.x2 = case_when(
+    Closed.restaurants.x2 == "12/23/2020" ~ closure_end_date,
+    TRUE ~ as.character(Closed.restaurants.x2)
+  ),
+  Reopened.restaurants.x2_m = replace_na(Reopened.restaurants.x2_m, 0),
+  NumberOfRestClosureDayFirstClosure = as.Date(Reopened.restaurants, format = "%m/%d/%y") - as.Date(Closed.restaurants, format = "%m/%d/%y"),
+  NumberOfRestClosureDaySecondClosure = as.Date(Reopened.restaurants.x2_m, format = "%m/%d/%y") - as.Date(Closed.restaurants.x2, format = "%m/%d/%y"),
+  NumberOfRestClosureDayThirdClosure = as.Date(Reopened.restaurants.x3, format = "%m/%d/%y") - as.Date(Closed.restaurants.x3, format = "%m/%d/%y"),
+  NumberOfRestClosureDayFirstClosure = replace_na(NumberOfRestClosureDayFirstClosure, 0),
+  NumberOfRestClosureDaySecondClosure = replace_na(NumberOfRestClosureDaySecondClosure, 0),
+  NumberOfRestClosureDayThirdClosure = replace_na(NumberOfRestClosureDayThirdClosure, 0),
+  TotalRestClosure = NumberOfRestClosureDayFirstClosure + NumberOfRestClosureDaySecondClosure + NumberOfRestClosureDayThirdClosure
+  ) %>%
+  select(
+    State, Closed.restaurants, Reopened.restaurants, Closed.restaurants.x2, NumberOfRestClosureDayFirstClosure, Reopened.restaurants.x2, Closed.restaurants.x2, Reopened.restaurants.x2_m, NumberOfRestClosureDaySecondClosure,  Closed.restaurants.x3, Reopened.restaurants.x3, NumberOfRestClosureDayThirdClosure, TotalRestClosure
+  )
+
+
+summary(restaurantClosure$Reopened.restaurants.x2)
+```
+
+### Movie Theatre Closure
+
+#### Movie Theatre Closure EDA. 
+
+All States except SD cloased their movie theatres between March to April. The states continued to reopen their theatres between end of March to Sep. The states that did not reopen their movie theatres in the first reopening round, had their closures throughout our study period. To account for their through out closure, we need to add the study end date to substitute for 0 for the states that closed and did not open in the first round. 
+
+In the  second round, most states maintained their earlier state. If they were open, they remain open. If they were closed, they remained closed. I hads to account for some states that remained open till the end of the study state,  which is apparently all the states that reopened. 
+
+#### Movie Theatre Closure Code
+
+```{r}
+movieClosure = closures %>%
+  mutate (
+    Reopened.movie.theaters_m = case_when(
+      Reopened.movie.theaters == 0 & Closed.movie.theaters != 0 ~ closure_end_date,
+      TRUE ~ as.character(Reopened.movie.theaters)
+    ), 
+    Reopened.movie.theaters.x2_m = case_when(
+      Closed.movie.theaters.x2 != 0 ~ closure_end_date,
+      TRUE ~ as.character(Reopened.movie.theaters.x2)
+    ),
+    NumberOfMovieClosureDayFirstClosure = as.Date(Reopened.movie.theaters_m, format = "%m/%d/%y") - as.Date(Closed.movie.theaters, format = "%m/%d/%y"),
+  NumberOfMovieClosureDaySecondClosure = as.Date(Reopened.movie.theaters.x2_m, format = "%m/%d/%y") - as.Date(Closed.movie.theaters.x2, format = "%m/%d/%y"), 
+    NumberOfMovieClosureDayFirstClosure = replace_na(NumberOfMovieClosureDayFirstClosure,0),
+   NumberOfMovieClosureDaySecondClosure = replace_na(NumberOfMovieClosureDaySecondClosure,0),
+  TotalMovieClosure = NumberOfMovieClosureDayFirstClosure + NumberOfMovieClosureDaySecondClosure
+  ) %>%
+  select(
+  State, Closed.movie.theaters, Reopened.movie.theaters, Reopened.movie.theaters_m, Closed.movie.theaters.x2, Reopened.movie.theaters.x2, Reopened.movie.theaters.x2_m,NumberOfMovieClosureDayFirstClosure, NumberOfMovieClosureDaySecondClosure, TotalMovieClosure
+  )
+movieClosure
+```
+
+### School Closures
+
+#### EDA School Closures. 
+
+There is no column for school reopening. We want to test for the time taken to close the schools after the first death in the state. There is only one state that did not close the schools. For that state, we want to keep closure as our study end date. Some states were proactive and they closed before the closing of the school. 
+
+
+#### School closure Codes:
+
+```{r}
+schoolClosure = closures %>%
+  mutate (
+    Closed.K.12.public.schools_m = case_when(
+      Closed.K.12.public.schools == 0 ~ closure_end_date,
+      TRUE ~ as.character(Closed.K.12.public.schools)
+    )
+  ) %>%
+  mutate(
+    NoOfDaysToSchoolClosing = as.Date(Closed.K.12.public.schools_m, format = "%m/%d/%y") - as.Date(first_case, format = "%m/%d/%y"),
+    ClosedBeforeFirstDeath = NoOfDaysToSchoolClosing < 0
+  ) %>%
+  select (
+    State, Closed.K.12.public.schools, Closed.K.12.public.schools_m, NoOfDaysToSchoolClosing, ClosedBeforeFirstDeath
+  )
+```
+
+
+### Mask Data
+```{r}
+mask = read.csv(file = "data/raw/COVID-19 US state policy database mask.csv")
+mask
+```
+
+#### Mask EDA
+We want to see three things in the masks world. First, we would like to see how many dyas did it take the state to implement the mask policy. Second we want to see how many days was the mask mandate in place. We would like to see fine and penalities in focus. 
+
+
+#### Mask Code
+
+```{r}
+masks  = mask %>%
+  rename(
+    face_mask_for_all = "Public.face.mask.mandate",
+    fines = "Face.mask.mandate.enforced.by.fines",
+    penalties = "Face.mask.mandate.enforced.by.criminal.charge.citation",
+    second_face_mask = "Second.mandate.for.facemasks.by.all.individuals.in.public.places",
+    end_face_mask = "End.face.mask.mandate",
+  ) %>%
+    merge(
+   nyt_by_state, by.y = "state", by.x = "State"
+  ) %>%
+  mutate (
+    did_implement_face_mandate = face_mask_for_all != 0,
+    face_mask_for_all_m = case_when (
+      face_mask_for_all == 0 ~ closure_end_date,
+      TRUE ~ as.character(face_mask_for_all)
+    ),
+    maskMandateDaysAfterFirstDeath = as.Date(face_mask_for_all_m, format = "%m/%d/%y") - as.Date(first_death, format = "%m/%d/%y"),
+    maskMandateDaysAfterFirstMarch = as.Date(face_mask_for_all_m, format = "%m/%d/%y") - as.Date(first_case, format = "%m/%d/%y"), 
+    maskMandateTillStudyEnd = as.Date(closure_end_date, format = "%m/%d/%y") - as.Date(face_mask_for_all_m, format = "%m/%d/%y")
+    #maskMandateTillStudyEnd = replace_na(maskMandateTillStudyEnd, 0)
+  ) %>%
+  select(
+    State, face_mask_for_all, face_mask_for_all_m, fines, penalties, second_face_mask, end_face_mask, did_implement_face_mandate, first_death, maskMandateDaysAfterFirstDeath, maskMandateDaysAfterFirstMarch, maskMandateTillStudyEnd
+  )
+masks
+```
+
+
+```{r}
+StateDeathsClosureMasks = restaurantClosure %>%
+  merge(schoolClosure, by="State") %>%
+  merge(gymClosure, by="State") %>%
+  merge(movieClosure, by="State") %>%
+  merge(masks, by="State") %>%
+  merge(merged, by.x = "State", by.y = "state") %>%
+  mutate(
+    deathsPerCapita = deaths/total_population
+  ) %>%
+  select(State, TotalRestClosure, TotalGymClosure, TotalMovieClosure, NoOfDaysToSchoolClosing, ClosedBeforeFirstDeath, fines, penalties, did_implement_face_mandate, maskMandateDaysAfterFirstDeath, maskMandateDaysAfterFirstMarch, maskMandateTillStudyEnd, sixtyfive_plus_percentage, pop_density, deaths, cases, total_population, deathsPerCapita )
+StateDeathsClosureMasks
+```
+
+```{r}
+StateDeathsClosureMasks = StateDeathsClosureMasks %>%
+  mutate(
+    TotalRestClosure  = as.numeric(TotalRestClosure),
+    TotalGymClosure   = as.numeric(TotalGymClosure),
+    TotalMovieClosure = as.numeric(TotalMovieClosure),
+    NoOfDaysToSchoolClosing = as.numeric(NoOfDaysToSchoolClosing),
+    maskMandateDaysAfterFirstDeath= as.numeric(maskMandateDaysAfterFirstDeath),
+    maskMandateDaysAfterFirstMarch= as.numeric(maskMandateDaysAfterFirstMarch),
+    maskMandateTillStudyEnd = as.numeric(maskMandateTillStudyEnd)
+  )
+StateDeathsClosureMasks
+```
+
+```{r}
+plot1 = StateDeathsClosureMasks %>%
+  ggplot(aes(x=TotalRestClosure)) +
+  geom_histogram() +
+  xlab("Number of States") +
+  ylab("Number of days Restuarants remained closed") +
+  ggtitle("Many states closed restaurants for more than a month, with the mean of 60.4 days ") +
+  geom_vline(aes(xintercept = mean(TotalRestClosure)), 
+             linetype = "dashed", size = 0.6)
+
+plot3 =  StateDeathsClosureMasks %>%
+  ggplot(aes(x=TotalGymClosure)) +
+  geom_histogram() +
+  xlab("Number of States") +
+  ylab("Number of days Gym remained closed") +
+  ggtitle("Many states closed their gym/indoor fitness, with the mean of 87.6 days ") +
+  geom_vline(aes(xintercept = mean(TotalGymClosure)), 
+             linetype = "dashed", size = 0.6)
+
+plot4 = StateDeathsClosureMasks %>%
+  ggplot(aes(x=TotalMovieClosure)) +
+  geom_histogram() +
+  xlab("Number of States") +
+  ylab("Number of days movie remained closed") +
+  ggtitle("Many states closed their movie theatre, with the mean of 107.86 days ") +
+  geom_vline(aes(xintercept = mean(TotalMovieClosure)), 
+             linetype = "dashed", size = 0.6)
+```
+```{r}
+plot2 = StateDeathsClosureMasks %>%
+  ggplot(aes(x=deathsPerCapita)) +
+  geom_histogram() +
+  labs(
+  title = "Number of deaths per capita per state"
+  ) +
+  xlab(
+    "Deaths per capita"
+  ) +
+  ylab(
+    "Number of States"
+  )
+
+(plot1)
+(plot2)
+(plot3)
+
+(plot4)
+
+mean(StateDeathsClosureMasks$TotalMovieClosure)
+```
+
+
+Investigating relationships between DRs & other variables:
+```{r}
+par(mfrow=c(2,3))
+plot(StateDeathsClosureMasks$maskMandateDaysAfterFirstMarch, StateDeathsClosureMasks$deathsPerCapita)
+plot(StateDeathsClosureMasks$TotalRestClosure, StateDeathsClosureMasks$deathsPerCapita)
+plot(StateDeathsClosureMasks$NoOfDaysToSchoolClosing, StateDeathsClosureMasks$deathsPerCapita, xlim=c(0,25))
+plot(StateDeathsClosureMasks$TotalGymClosure, StateDeathsClosureMasks$deathsPerCapita)
+plot(StateDeathsClosureMasks$pop_density, StateDeathsClosureMasks$deathsPerCapita, xlim=c(0,1000))
+```
+
+#### Model Building
+```{r}
+model1 <- lm(deathsPerCapita ~ maskMandateDaysAfterFirstMarch + did_implement_face_mandate + TotalRestClosure + NoOfDaysToSchoolClosing, data = StateDeathsClosureMasks)
+model2 <- lm(deathsPerCapita ~  maskMandateDaysAfterFirstMarch + did_implement_face_mandate + TotalRestClosure + NoOfDaysToSchoolClosing + maskMandateTillStudyEnd + TotalGymClosure + TotalMovieClosure, data = StateDeathsClosureMasks)
+model3 <- lm(deathsPerCapita ~ maskMandateDaysAfterFirstMarch + did_implement_face_mandate + TotalRestClosure + NoOfDaysToSchoolClosing + maskMandateTillStudyEnd + TotalGymClosure + TotalMovieClosure + pop_density + sixtyfive_plus_percentage, data = StateDeathsClosureMasks)
+stargazer(model1, model2, model3, type = "text")
+```
+
+```{r}
+summary(model1)
+```
+```{r}
+pairs(StateDeathsClosureMasks %>% 
+        select (TotalMovieClosure, TotalRestClosure, TotalGymClosure, maskMandateDaysAfterFirstMarch))
+
+library(car)
+
+vif(model2)
+```
+
+```{r}
+plot(model1)
+```
+
+
+```{r}
+plot(model2)
+```
+
+```{r}
+summary(model2)
+```
+
+
+```{r}
+summary(model3)
+```
+```{r}
+plot(model3)
+```
+
+#### Assessing assumptions
+We will only include violations in the final report:
+***1. Independent, Identically Distributed***
+- States' decisions are affected by each other
+
+***2. Linear Conditional Expectation***  
+To assess this assumption, we examine the Residuals vs. Fitted plot for symmetrical residuals across the range of fitted values:  
+```{r, echo = FALSE, message = FALSE, error = FALSE, warning = FALSE}
+plot(model2 , which = 1)
+```  
+
+***3. No (nearly) Perfect Collinearity***
+```{r, echo = FALSE, message = FALSE, error = FALSE, warning = FALSE}
+corrplot(cor(StateDeathsClosureMasks %>% select({model_2_variables})))
+StateDeathsClosureMasks %>% 
+  ggplot(aes(x = length, y = rate^2)) +
+  geom_point() 
+```
+
+***4. Homoskedastic Errors***
+To check for heteroskedastic errors, we examine the Scale-Location plot, which shows the spread of residuals across the range of predictors:  
+```{r, echo = FALSE, message = FALSE, error = FALSE, warning = FALSE} 
+plot(model1, which = 3)
+bp_test <- bptest(model2)
+bp_test
+```
+
+***5. Normally Distributed Errors***  
+We examine the Q-Q plot to determine how the residuals compare to the normal distribution:  
+```{r, echo = FALSE, message = FALSE, error = FALSE, warning = FALSE} 
+plot(model2, which = 2)
+``` 
+```{r}
+write.csv(StateDeathsClosureMasks, "StateM.csv")
+```
+
